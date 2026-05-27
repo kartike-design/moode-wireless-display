@@ -2,7 +2,7 @@
 
 A full-screen, portrait-mode now-playing display for [moOde Audio Player](https://moodeaudio.org/), designed for a dedicated Android device (phone or tablet) running in kiosk mode. No Python, no extra daemons — everything runs through moOde's existing nginx on port 80.
 
-![Display showing album art, track info, VU meters and literary clock](screenshot-placeholder.png)
+![Now playing display](Screenshot_20260527-002519.jpg)
 
 ---
 
