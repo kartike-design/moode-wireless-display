@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Now Playing</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0c; --surface: #111114;
+    --text-primary: #f0ece4; --text-secondary: #7a7670; --text-dim: #3a3835;
+    --accent: #c8a96e; --accent-dim: rgba(200,169,110,0.15); --radius: 18px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%; background: var(--bg); color: var(--text-primary);
+    font-family: 'DM Sans', sans-serif; overflow: hidden; -webkit-font-smoothing: antialiased;
+  }
+  body { display: flex; flex-direction: column; align-items: center; position: relative; min-height: 100dvh; }
+  #ambient { position: fixed; inset: -40px; z-index: 0; background-size: cover; background-position: center; filter: blur(80px) saturate(1.4) brightness(0.3); opacity: 0; transition: background-image 1.2s ease, opacity 1.5s ease; }
+  #ambient.visible { opacity: 1; }
+  #shift-wrap { position: relative; z-index: 1; width: 100%; max-width: 420px; display: flex; flex-direction: column; align-items: center; padding: 56px 22px 16px; min-height: 100dvh; justify-content: center; will-change: transform; transition: transform 14s ease; }
+  .status-bar { position: fixed; top: 0; left: 0; right: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; padding: 14px 24px 10px; background: linear-gradient(to bottom, rgba(10,10,12,0.92) 0%, transparent 100%); }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); transition: background 0.4s ease; }
+  .status-dot.playing { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .status-dot.paused  { background: #666; }
+  .status-label { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--text-secondary); font-weight: 500; }
+  .clock { font-size: 11px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .art-container { width: 100%; aspect-ratio: 1/1; border-radius: var(--radius); overflow: hidden; position: relative; background: var(--surface); box-shadow: 0 28px 64px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.04); flex-shrink: 0; margin-bottom: 18px; }
+  #album-art { width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; transition: opacity 0.6s ease; }
+  #album-art.loaded { opacity: 1; }
+  .art-placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; color: var(--text-dim); }
+  .source-badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; background: var(--accent-dim); border: 1px solid rgba(200,169,110,0.2); border-radius: 100px; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); font-weight: 500; align-self: flex-start; margin-bottom: 8px; opacity: 0; transition: opacity 0.4s ease; }
+  .source-badge.visible { opacity: 1; }
+  .source-badge .dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .source-badge.radio .dot { animation: radio-pulse 2s ease infinite; }
+  @keyframes radio-pulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+  .meta { width: 100%; display: flex; flex-direction: column; gap: 5px; margin-bottom: 16px; }
+  .track-title { font-family: 'DM Serif Display', serif; font-size: clamp(26px, 8vw, 40px); line-height: 1.1; color: var(--text-primary); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; transition: opacity 0.4s ease; }
+  .track-artist { font-size: 18px; color: var(--accent); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: opacity 0.4s ease; }
+  .track-album  { font-size: 14px; color: var(--text-secondary); font-weight: 300; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: opacity 0.4s ease; }
+  .progress-wrap { width: 100%; margin-bottom: 16px; }
+  .progress-bar-bg { width: 100%; height: 2px; background: var(--text-dim); border-radius: 1px; overflow: hidden; margin-bottom: 8px; }
+  .progress-bar-fill { height: 100%; background: var(--accent); border-radius: 1px; width: 0%; transition: width 0.2s linear; }
+  .progress-times { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .vu-section { width: 100%; display: flex; gap: 10px; opacity: 0; transition: opacity 1.2s ease; }
+  .vu-section.active { opacity: 1; }
+  .vu-wrap { flex: 1; background: #0c0a06; border: 1px solid rgba(200,165,80,0.12); border-radius: 12px; padding: 8px 6px 5px; position: relative; overflow: hidden; }
+  .vu-wrap::before { content: ''; position: absolute; inset: 0; background: radial-gradient(ellipse at 50% 115%, rgba(200,155,50,0.09) 0%, transparent 62%); pointer-events: none; }
+  .vu-label { text-align: center; font-size: 8px; letter-spacing: 0.25em; text-transform: uppercase; color: rgba(200,165,80,0.30); font-weight: 500; margin-top: 2px; }
+  .vu-mode { position: absolute; top: 5px; right: 7px; font-size: 7px; letter-spacing: 0.1em; color: rgba(200,165,80,0.25); font-weight: 500; text-transform: uppercase; }
+  .vu-canvas { width: 100%; height: 82px; display: block; }
+  #audio-prompt { position: fixed; inset: 0; z-index: 100; background: rgba(10,10,12,0.82); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; opacity: 0; pointer-events: none; transition: opacity 0.4s ease; }
+  #audio-prompt.show { opacity: 1; pointer-events: all; }
+  #audio-prompt p { font-size: 13px; color: var(--text-secondary); letter-spacing: 0.06em; }
+  #tap-btn { padding: 14px 36px; background: var(--accent-dim); border: 1px solid rgba(200,169,110,0.4); border-radius: 100px; color: var(--accent); font-size: 14px; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; min-width: 160px; text-align: center; }
+
+  /* ── LITERARY CLOCK ─────────────────────────────────────────── */
+  #lit-clock {
+    position: fixed; inset: 0; z-index: 20;
+    background: #000;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 48px 36px;
+    opacity: 0; pointer-events: none;
+    transition: opacity 1.2s ease;
+  }
+  #lit-clock.show { opacity: 1; pointer-events: all; }
+  .lit-quote-text {
+    font-family: 'DM Serif Display', serif;
+    font-size: clamp(24px, 7vw, 32px);
+    line-height: 1.65;
+    color: var(--text-primary);
+    text-align: center;
+    margin-bottom: 32px;
+    transition: opacity 0.5s ease;
+  }
+  .time-highlight { color: #E9212C; font-style: italic; }
+  .lit-attribution { display: flex; flex-direction: column; align-items: center; gap: 6px; transition: opacity 0.5s ease; }
+  .lit-book   { font-family: 'DM Serif Display', serif; font-style: italic; font-size: 16px; color: var(--accent); }
+  .lit-author { font-size: 13px; color: var(--text-secondary); letter-spacing: 0.08em; font-weight: 300; }
+
+  body::after { content: ''; position: fixed; inset: 0; z-index: 50; pointer-events: none; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.035) 2px, rgba(0,0,0,0.035) 4px); }
+  .fade-out { opacity: 0 !important; transition: opacity 0.25s ease !important; }
+  @keyframes pulse-dot { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+  .status-dot.buffering { animation: pulse-dot 1.2s ease infinite; background: #888; }
+</style>
+</head>
+<body>
+
+<div id="ambient"></div>
+<div class="status-bar">
+  <div class="status-dot" id="status-dot"></div>
+  <span class="status-label" id="status-label">connecting</span>
+  <span class="clock" id="clock">--:--</span>
+</div>
+
+<div id="shift-wrap">
+  <div class="art-container">
+    <div class="art-placeholder" id="art-placeholder">
+      <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+        <circle cx="24" cy="24" r="20" stroke="currentColor" stroke-width="1.5"/>
+        <circle cx="24" cy="24" r="7"  stroke="currentColor" stroke-width="1.5"/>
+        <circle cx="24" cy="24" r="2"  fill="currentColor"/>
+      </svg>
+    </div>
+    <img id="album-art" src="" alt="" draggable="false"
+         onload="this.classList.add('loaded')"
+         onerror="this.classList.remove('loaded')">
+  </div>
+  <div class="source-badge" id="source-badge"><span class="dot"></span><span id="source-text">local</span></div>
+  <div class="meta">
+    <div class="track-title"  id="track-title">—</div>
+    <div class="track-artist" id="track-artist"></div>
+    <div class="track-album"  id="track-album"></div>
+  </div>
+  <div class="progress-wrap" id="progress-wrap" style="display:none">
+    <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill"></div></div>
+    <div class="progress-times"><span id="time-elapsed">0:00</span><span id="time-total">0:00</span></div>
+  </div>
+  <div class="vu-section" id="vu-section">
+    <div class="vu-wrap">
+      <span class="vu-mode" id="vu-mode-L">sim</span>
+      <canvas class="vu-canvas" id="vu-L"></canvas>
+      <div class="vu-label">L</div>
+    </div>
+    <div class="vu-wrap">
+      <span class="vu-mode" id="vu-mode-R">sim</span>
+      <canvas class="vu-canvas" id="vu-R"></canvas>
+      <div class="vu-label">R</div>
+    </div>
+  </div>
+</div>
+
+<!-- Literary clock — quote display, no numerical time -->
+<div id="lit-clock">
+  <div class="lit-quote-text"  id="lit-quote-text"></div>
+  <div class="lit-attribution" id="lit-attribution"></div>
+</div>
+
+<div id="audio-prompt">
+  <p>Tap to enable live VU meters</p>
+  <div id="tap-btn">Enable</div>
+</div>
+
+<script>
+const API_URL       = '/nowplaying.php';
+const COVER_URL     = '/nowplaying-art.php';
+const POLL_MS       = 3000;
+const IDLE_DELAY_MS = 10000;   // 10s after stop/pause before literary clock appears
+
+let lastTitle = '', lastStableArtKey = '', progressTimer = null;
+let currentElapsed = 0, currentDuration = 0;
+let isPlaying = false, lastState = '';
+let idleTimer = null, clockVisible = false, clockRefreshTimer = null;
+let quotesData = null, quotesPromise = null;
+
+const $title    = document.getElementById('track-title');
+const $artist   = document.getElementById('track-artist');
+const $album    = document.getElementById('track-album');
+const $art      = document.getElementById('album-art');
+const $ambient  = document.getElementById('ambient');
+const $dot      = document.getElementById('status-dot');
+const $label    = document.getElementById('status-label');
+const $source   = document.getElementById('source-badge');
+const $sourceT  = document.getElementById('source-text');
+const $progress = document.getElementById('progress-wrap');
+const $fill     = document.getElementById('progress-fill');
+const $eT       = document.getElementById('time-elapsed');
+const $tT       = document.getElementById('time-total');
+const $vuSec    = document.getElementById('vu-section');
+const $litClock = document.getElementById('lit-clock');
+
+// ── Status bar clock ──────────────────────────────────────────
+function updateClock() {
+  const n = new Date();
+  document.getElementById('clock').textContent =
+    n.getHours().toString().padStart(2,'0') + ':' +
+    n.getMinutes().toString().padStart(2,'0');
+}
+updateClock(); setInterval(updateClock, 10000);
+
+function fmt(s) {
+  s = Math.max(0, Math.floor(s));
+  return `${Math.floor(s/60)}:${(s%60).toString().padStart(2,'0')}`;
+}
+
+// ── Progress bar ──────────────────────────────────────────────
+function updateProgressBar(elapsed, duration, state) {
+  if (!duration || duration <= 0) { $progress.style.display = 'none'; return; }
+  $progress.style.display = 'block';
+  $fill.style.width = Math.min(100, (elapsed / duration) * 100) + '%';
+  $eT.textContent = fmt(elapsed);
+  $tT.textContent = fmt(duration);
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+  if (state === 'play') {
+    progressTimer = setInterval(() => {
+      if (!isPlaying) return;
+      currentElapsed = Math.min(currentDuration, currentElapsed + 1);
+      $fill.style.width = Math.min(100, (currentElapsed / currentDuration) * 100) + '%';
+      $eT.textContent = fmt(currentElapsed);
+    }, 1000);
+  }
+}
+
+// ── Cover art ─────────────────────────────────────────────────
+function updateArt(stableKey) {
+  if (stableKey === lastStableArtKey) return;
+  lastStableArtKey = stableKey;
+  const newUrl = `${COVER_URL}?t=${encodeURIComponent(stableKey)}&cb=${Date.now()}`;
+  document.getElementById('art-placeholder').style.display = 'none';
+  $art.classList.remove('loaded');
+  $art.src = newUrl;
+  $ambient.style.backgroundImage = `url('${newUrl}')`;
+  $ambient.classList.add('visible');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  LITERARY CLOCK
+//  Quotes sourced from the Literary Clock project by Jez Swanson
+//  (https://github.com/JohannesNE/literature-clock), originally
+//  compiled from the Guardian books project.
+//  CSV data: https://github.com/solarkennedy/epaper-watch
+// ══════════════════════════════════════════════════════════════
+
+function parseQuoteLine(line) {
+  const pipes = [];
+  for (let i = 0; i < line.length && pipes.length < 4; i++)
+    if (line[i] === '|') pipes.push(i);
+  if (pipes.length < 3) return null;
+  return {
+    time:        line.slice(0, pipes[0]).trim(),
+    time_string: line.slice(pipes[0]+1, pipes[1]).trim(),
+    quote:       line.slice(pipes[1]+1, pipes[2]).trim(),
+    book:        pipes[3] !== undefined
+                   ? line.slice(pipes[2]+1, pipes[3]).trim()
+                   : line.slice(pipes[2]+1).trim(),
+    author:      pipes[3] !== undefined ? line.slice(pipes[3]+1).trim() : ''
+  };
+}
+
+function ensureQuotes() {
+  if (quotesData)    return Promise.resolve(quotesData);
+  if (quotesPromise) return quotesPromise;
+  quotesPromise = fetch('/quotes.csv')
+    .then(r => r.text())
+    .then(text => {
+      const lines = text.split(/\r?\n/);
+      quotesData = [];
+      for (let i = 1; i < lines.length; i++) {
+        const q = parseQuoteLine(lines[i]);
+        if (q && q.time && q.quote) quotesData.push(q);
+      }
+      return quotesData;
+    })
+    .catch(() => { quotesData = []; return []; });
+  return quotesPromise;
+}
+
+function getQuoteForTime(hhmm) {
+  if (!quotesData || !quotesData.length) return null;
+  if (!quotesData._byTime) {
+    quotesData._byTime = {};
+    quotesData.forEach(q => {
+      if (!quotesData._byTime[q.time]) quotesData._byTime[q.time] = [];
+      quotesData._byTime[q.time].push(q);
+    });
+  }
+  const pick = (list) => list[Math.floor(Math.random() * list.length)];
+  if (quotesData._byTime[hhmm]?.length) return pick(quotesData._byTime[hhmm]);
+  const [h, m] = hhmm.split(':').map(Number);
+  const totalMins = h * 60 + m;
+  for (let delta = 1; delta <= 10; delta++) {
+    for (const sign of [1, -1]) {
+      const t  = ((totalMins + sign * delta) + 1440) % 1440;
+      const key = `${Math.floor(t/60).toString().padStart(2,'0')}:${(t%60).toString().padStart(2,'0')}`;
+      if (quotesData._byTime[key]?.length) return pick(quotesData._byTime[key]);
+    }
+  }
+  return pick(quotesData);
+}
+
+function escH(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function highlightTime(quote, ts) {
+  const eq = escH(quote), et = escH(ts);
+  if (!et) return eq;
+  const idx = eq.toLowerCase().indexOf(et.toLowerCase());
+  if (idx === -1) return eq;
+  return eq.slice(0, idx) +
+    `<span class="time-highlight">${eq.slice(idx, idx + et.length)}</span>` +
+    eq.slice(idx + et.length);
+}
+
+function updateClockContent() {
+  const now  = new Date();
+  const hhmm = now.getHours().toString().padStart(2,'0') + ':' +
+               now.getMinutes().toString().padStart(2,'0');
+  const q = getQuoteForTime(hhmm);
+  if (!q) return;
+  const $q = document.getElementById('lit-quote-text');
+  const $a = document.getElementById('lit-attribution');
+  $q.style.opacity = '0';
+  $a.style.opacity = '0';
+  setTimeout(() => {
+    $q.innerHTML = '\u201c' + highlightTime(q.quote, q.time_string) + '\u201d';
+    const parts = [];
+    if (q.book)   parts.push(`<span class="lit-book">${escH(q.book)}</span>`);
+    if (q.author) parts.push(`<span class="lit-author">${escH(q.author)}</span>`);
+    $a.innerHTML = parts.join('');
+    $q.style.opacity = '1';
+    $a.style.opacity = '1';
+  }, 500);
+}
+
+function scheduleClockRefresh() {
+  clearTimeout(clockRefreshTimer);
+  const now    = new Date();
+  const msLeft = (60 - now.getSeconds()) * 1000 - now.getMilliseconds() + 80;
+  clockRefreshTimer = setTimeout(() => {
+    if (clockVisible) { updateClockContent(); scheduleClockRefresh(); }
+  }, msLeft);
+}
+
+async function showClock() {
+  await ensureQuotes();
+  clockVisible = true;
+  updateClockContent();
+  $litClock.classList.add('show');
+  scheduleClockRefresh();
+}
+
+function hideClock() {
+  clockVisible = false;
+  clearTimeout(clockRefreshTimer);
+  $litClock.classList.remove('show');
+}
+
+function scheduleIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(showClock, IDLE_DELAY_MS);
+}
+
+function cancelIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = null;
+  hideClock();
+}
+
+// ── Render ────────────────────────────────────────────────────
+function renderStopped() {
+  const wasAlreadyStopped = (lastState === 'stop');
+  isPlaying = false; lastState = 'stop';
+  $dot.className = 'status-dot'; $label.textContent = 'stopped';
+  $source.classList.remove('visible');
+  $vuSec.classList.remove('active');
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+  $progress.style.display = 'none';
+  currentElapsed = 0; currentDuration = 0;
+  if (!wasAlreadyStopped) scheduleIdle();
+}
+
+function renderPlaying(data) {
+  const prevState    = lastState;
+  const state        = data.state  || 'play';
+  const source       = data.source || 'local';
+  const title        = data.title  || 'Unknown';
+  const titleChanged = (title !== lastTitle);
+
+  isPlaying = (state === 'play');
+  lastState = state;
+
+  if (state === 'play') {
+    cancelIdle();
+  } else if (prevState !== state) {
+    scheduleIdle();
+  }
+
+  $vuSec.classList[state === 'play' ? 'add' : 'remove']('active');
+
+  if (state === 'play') {
+    $dot.className = 'status-dot playing';
+    $label.textContent = source === 'radio' ? 'live radio' : 'now playing';
+  } else {
+    $dot.className = 'status-dot paused';
+    $label.textContent = 'paused';
+  }
+  $sourceT.textContent = source;
+  $source.className = `source-badge visible${source === 'radio' ? ' radio' : ''}`;
+
+  updateArt(`${source}-${title}-${data.station || ''}`);
+
+  if (titleChanged) {
+    lastTitle = title;
+    [$title, $artist, $album].forEach(e => e.classList.add('fade-out'));
+    setTimeout(() => {
+      $title.textContent  = data.title  || '—';
+      $artist.textContent = data.artist || '';
+      $album.textContent  = data.album  || '';
+      [$title, $artist, $album].forEach(e => e.classList.remove('fade-out'));
+    }, 250);
+  }
+
+  let elapsed  = parseFloat(data.elapsed)  || 0;
+  let duration = parseFloat(data.duration) || 0;
+  if (source === 'spotify' && !titleChanged && elapsed === 0 && currentElapsed > 2) {
+    elapsed = currentElapsed;
+  }
+  currentElapsed  = elapsed;
+  currentDuration = duration;
+  updateProgressBar(elapsed, duration, state);
+}
+
+// ── Poll ──────────────────────────────────────────────────────
+async function poll() {
+  try {
+    const r = await fetch(API_URL, { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    if (!d.state || d.state === 'stop') renderStopped();
+    else renderPlaying(d);
+  } catch(e) {
+    $dot.className = 'status-dot buffering';
+    $label.textContent = 'connecting…';
+  }
+}
+poll(); setInterval(poll, POLL_MS);
+
+(function trySocket(){
+  const s = document.createElement('script'); s.src = '/socket.io/socket.io.js';
+  s.onload = () => {
+    try {
+      const sock = io(window.location.origin, { transports: ['websocket'], reconnection: true });
+      sock.on('connect', () => sock.emit('get_state'));
+      sock.on('update_state', p => {
+        const d = typeof p === 'string' ? JSON.parse(p) : p;
+        if (!d.state || d.state === 'stop') renderStopped(); else renderPlaying(d);
+      });
+    } catch(e) {}
+  };
+  document.head.appendChild(s);
+})();
+
+// ── VU Meters (simulated — no audio capture required) ─────────
+const VU={
+  ch:{L:{pos:0},R:{pos:0}},
+  sim:{t:0,sigL:0.1,sigR:0.1},
+  cvL:null,cvR:null,lastMs:0,
+
+  init(){
+    this.cvL=document.getElementById('vu-L');
+    this.cvR=document.getElementById('vu-R');
+    this.resize();
+    window.addEventListener('resize',()=>this.resize());
+    setInterval(()=>{
+      const now=performance.now();
+      const dt=Math.min(0.05,(now-this.lastMs)/1000);
+      this.lastMs=now;
+      const sig=this.simulate(dt);
+      this.ballistic('L',sig.L,dt);
+      this.ballistic('R',sig.R,dt);
+      this.draw(this.cvL,this.ch.L.pos);
+      this.draw(this.cvR,this.ch.R.pos);
+    },16);
+  },
+
+  resize(){
+    const dpr=window.devicePixelRatio||1;
+    [this.cvL,this.cvR].forEach(c=>{if(!c)return;c.width=Math.round(c.offsetWidth*dpr);c.height=Math.round(c.offsetHeight*dpr);});
+  },
+
+  simulate(dt){
+    const s=this.sim;s.t+=dt;
+    if(!isPlaying){
+      s.sigL=Math.max(0,s.sigL-dt*8.0);
+      s.sigR=Math.max(0,s.sigR-dt*8.0);
+    }else{
+      const wL=0.34*Math.sin(s.t*1.81)+0.19*Math.sin(s.t*3.14+0.9)+0.11*Math.sin(s.t*7.23+1.7)+0.08*Math.abs(Math.sin(s.t*0.67));
+      const wR=0.34*Math.sin(s.t*1.81+0.6)+0.19*Math.sin(s.t*3.14+1.5)+0.11*Math.sin(s.t*7.23+0.3)+0.08*Math.abs(Math.sin(s.t*0.67+0.4));
+      s.sigL=Math.max(0.06,Math.min(0.96,0.52+wL*0.44));
+      s.sigR=Math.max(0.06,Math.min(0.96,0.50+wR*0.44));
+      if(Math.random()<dt*1.1)s.sigL=Math.min(0.97,s.sigL+0.18+Math.random()*0.16);
+      if(Math.random()<dt*0.9)s.sigR=Math.min(0.97,s.sigR+0.18+Math.random()*0.16);
+    }
+    return{L:s.sigL,R:s.sigR};
+  },
+
+  ballistic(ch,target,dt){const A=30,D=5.2,c=this.ch[ch],diff=target-c.pos;c.pos+=diff*Math.min(1,(diff>0?A:D)*dt);c.pos=Math.max(0,Math.min(1,c.pos));},
+
+  draw(cv,level){
+    if(!cv)return;
+    const ctx=cv.getContext('2d'),W=cv.width,H=cv.height,dpr=window.devicePixelRatio||1;
+    ctx.clearRect(0,0,W,H);
+    const cx=W*0.5,cy=H*1.10,Rn=H*1.04,Ra=H*0.86;
+    const HALF=0.873,aMin=-Math.PI/2-HALF,aMax=-Math.PI/2+HALF;
+    const nA=aMin+(aMax-aMin)*level;
+    [{db:-20},{db:-10},{db:-7},{db:-5},{db:-3},{db:-1},{db:0},{db:1},{db:3}].forEach(m=>{
+      const p=this.dbToPos(m.db),a=aMin+(aMax-aMin)*p,cos=Math.cos(a),sin=Math.sin(a),ov=m.db>=0;
+      ctx.beginPath();ctx.moveTo(cx+cos*(Ra-(ov?7:5)*dpr),cy+sin*(Ra-(ov?7:5)*dpr));ctx.lineTo(cx+cos*(Ra+2*dpr),cy+sin*(Ra+2*dpr));
+      ctx.strokeStyle=ov?'rgba(220,65,55,0.70)':'rgba(195,160,75,0.55)';ctx.lineWidth=(ov?1.6:1.1)*dpr;ctx.stroke();
+      const sl={'-20':'-20','-10':'-10','-5':'-5','0':'0','3':'+3'}[String(m.db)];
+      if(sl){const lr=Ra-15*dpr;ctx.save();ctx.translate(cx+Math.cos(a)*lr,cy+Math.sin(a)*lr);ctx.rotate(a+Math.PI/2);ctx.font=`${6.2*dpr}px 'DM Sans',sans-serif`;ctx.fillStyle=ov?'rgba(215,70,60,0.80)':'rgba(195,160,75,0.65)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(sl,0,0);ctx.restore();}
+    });
+    const zA=aMin+(aMax-aMin)*this.dbToPos(0);
+    ctx.beginPath();ctx.arc(cx,cy,Ra,aMin,zA,false);ctx.strokeStyle='rgba(195,160,75,0.16)';ctx.lineWidth=1.5*dpr;ctx.stroke();
+    ctx.beginPath();ctx.arc(cx,cy,Ra,zA,aMax,false);ctx.strokeStyle='rgba(210,55,45,0.28)';ctx.lineWidth=1.5*dpr;ctx.stroke();
+    ctx.font=`bold ${5*dpr}px 'DM Sans',sans-serif`;ctx.fillStyle='rgba(195,160,75,0.14)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('VU',cx,cy-Ra*0.52);
+    const nx=cx+Math.cos(nA)*Rn,ny=cy+Math.sin(nA)*Rn;
+    ctx.beginPath();ctx.moveTo(cx+1.2*dpr,cy+1.2*dpr);ctx.lineTo(nx+1.2*dpr,ny+1.2*dpr);ctx.strokeStyle='rgba(0,0,0,0.50)';ctx.lineWidth=2.2*dpr;ctx.lineCap='round';ctx.stroke();
+    const g=ctx.createLinearGradient(cx,cy,nx,ny);g.addColorStop(0,'rgba(160,125,45,0.15)');g.addColorStop(0.2,'#a07830');g.addColorStop(0.75,'#c8a050');g.addColorStop(1,'#eed868');
+    ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(nx,ny);ctx.strokeStyle=g;ctx.lineWidth=1.7*dpr;ctx.lineCap='round';ctx.stroke();
+    ctx.beginPath();ctx.arc(nx,ny,2*dpr,0,Math.PI*2);ctx.fillStyle='#f4e878';ctx.fill();
+    ctx.beginPath();ctx.arc(cx,cy,5.5*dpr,0,Math.PI*2);ctx.fillStyle='#181410';ctx.fill();ctx.strokeStyle='rgba(195,160,75,0.28)';ctx.lineWidth=0.8*dpr;ctx.stroke();
+    ctx.beginPath();ctx.arc(cx,cy,3.6*dpr,0,Math.PI*2);ctx.fillStyle='#b89040';ctx.fill();
+    ctx.beginPath();ctx.arc(cx,cy,1.7*dpr,0,Math.PI*2);ctx.fillStyle='#f0df70';ctx.fill();
+  },
+  dbToPos(db){return Math.max(0,Math.min(1,(db+20)/23));}
+};
+
+// ── OLED burn-in protection ───────────────────────────────────
+// - Pixel shift: ±7px random translate every 3.5 minutes
+// - Brightness cycling: subtle dimming every 2 minutes
+const OLED={
+  wrap:document.getElementById('shift-wrap'),MAX_PX:7,
+  init(){setTimeout(()=>this.shift(),30000);setInterval(()=>this.shift(),210000);setInterval(()=>this.dim(),120000);},
+  shift(){const x=((Math.random()*2)-1)*this.MAX_PX,y=((Math.random()*2)-1)*this.MAX_PX;this.wrap.style.transform=`translate(${x.toFixed(1)}px,${y.toFixed(1)}px)`;},
+  dim(){document.body.style.filter=`brightness(${(0.88+Math.random()*0.12).toFixed(2)})`;setTimeout(()=>{document.body.style.filter='brightness(1)';},20000);}
+};
+
+VU.init();
+OLED.init();
+ensureQuotes();  // fetch CSV in background immediately
+
+document.addEventListener('touchstart', e=>{
+  if (!e.target.closest('#audio-prompt')) e.preventDefault();
+},{passive:false});
+</script>
+</body>
+</html>
