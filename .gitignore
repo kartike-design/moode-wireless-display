@@ -1,0 +1,13 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+
+# No screenshots until user adds their own
+screenshots/*.jpg
+screenshots/*.png
+!screenshots/.gitkeep

@@ -1,187 +1,205 @@
-# moOde Now Playing Display
+# moode-nowplaying
 
-A full-screen, portrait-mode now-playing display for [moOde Audio Player](https://moodeaudio.org/), designed for a dedicated Android device (phone or tablet) running in kiosk mode. No Python, no extra daemons — everything runs through moOde's existing nginx on port 80.
+**An always-on Now Playing wireless display for moOde Audio Player**
 
-![Now playing display](Screenshot_20260527-002549.jpg)
+Turn any Android phone or tablet into a dedicated wireless music display for your [moOde Audio Player](https://moodeaudio.org) — showing album art, track info, retro analog VU meters, and a literary clock screensaver, all updating in real time over your local network.
 
----
-
-## Features
-
-- **Album art** with blurred ambient background
-- **Track metadata** — title, artist, album with smooth fade transitions
-- **Progress bar** with elapsed/total time (local files and radio)
-- **Simulated VU meters** — analogue-style needle meters, active during playback
-- **Source badge** — Local / Radio / Spotify, with animated pulse for live radio
-- **Literary clock** — appears 10 seconds after playback stops or pauses; shows a quote from literature containing the current time, with the time phrase highlighted in red. 1,877 quotes covering every minute of the day.
-- **OLED burn-in protection** — pixel shift (±7 px random translate every 3.5 min) and brightness cycling (subtle dimming every 2 min)
-- **True black idle** — `#000000` background on literary clock screen
+> Works with local file playback, internet radio, and Spotify Connect (with correct play/pause detection). No app to install, no extra hardware — just a browser pointed at your Pi.
 
 ---
 
-## Sources supported
+## What it looks like
 
-| Source | Art | Progress | VU meters | Pause → clock |
-|---|---|---|---|---|
-| Local files (FLAC, MP3, etc.) | ✅ moOde thumbnail cache | ✅ | ✅ | ✅ |
-| Internet radio | ✅ station logo files | ➖ (live stream) | ✅ | ✅ |
-| Spotify Connect (librespot) | ✅ Spotify CDN | ✅ | ✅ | ✅ |
-| AirPlay | ⚠️ untested — no Apple device available | ⚠️ | ⚠️ | ⚠️ |
-
----
-
-## Hardware tested on
-
-- **Server**: Raspberry Pi 5 with audio HAT, moOde Audio Player 10.x (headless)
-- **Display**: OnePlus 3T (Android, portrait), [Fully Kiosk Browser](https://www.fully-kiosk.com/)
-- Should scale to any Android phone or tablet in portrait orientation. The layout uses `max-width: 420px` and `clamp()` font sizes, so it adapts gracefully to larger screens.
+- Full-screen portrait layout for phones and tablets
+- Album art with correct behaviour across local files, radio station logos, and Spotify cover art
+- Track title that shrinks to fit rather than truncating
+- Retro analog needle VU meters — warm backlit brass styling, dual scale (linear + dB)
+- A literary clock screensaver that replaces the idle screen after 10 seconds of pause/stop, showing a time-matched quote with the time phrase highlighted
+- OLED burn-in protection built in (pixel drift, brightness cycling, true-black idle)
 
 ---
 
-## Files
+## Architecture
 
 ```
-nowplaying.html        — display UI (serves at http://YOUR_PI_IP/nowplaying.html)
-nowplaying.php         — metadata API (reads MPD + Spotify state)
-nowplaying-art.php     — cover art server (local cache / radio logos / Spotify CDN proxy)
-patch_spotevent.py     — one-time patch for moOde's spotevent.sh (Spotify pause fix)
-quotes.csv             — 1,877 literary clock quotes (pipe-delimited)
+moOde (existing, untouched)
+  |-- MPD on port 6600                    <- local file + radio metadata
+  |-- librespot event hook (modified)     <- Spotify play/pause/track events
+  \-- cfg_radio SQLite table               <- authoritative radio station names
+
+         read by three small files, no external network calls in PHP
+
+nowplaying.php      -> JSON API, arbitrates between local/radio/Spotify
+nowplaying-art.php  -> cover art (local thumbnail cache, radio logos, cached Spotify art)
+nowplaying.html     -> the display itself
 ```
+
+Everything runs through moOde's own nginx on port 80 — no separate services, no Python daemons, no background watchdog processes. Access the display at `http://YOUR_PI_IP/nowplaying.html`.
+
+### Why a modified librespot hook is needed
+
+librespot (Spotify's playback engine) stays running through a pause — it doesn't disconnect, so there's no simple way to tell "paused" from "playing" by process state alone. moOde's own event hook (`spotevent.sh`) only listens for session connect/disconnect and track-change events; it silently ignores librespot's own `playing`/`paused`/`stopped` events. This project extends that hook to capture those events and write a small local state file, which `nowplaying.php` reads directly — no polling, no guessing.
+
+The same hook also caches Spotify's cover art to a local file *synchronously*, before announcing the new track — this avoids a race where the display could show a new track's title before its artwork had finished downloading.
+
+### A quirk worth knowing: radio "pause" is really "stop"
+
+MPD can't truly pause a live stream (there's nothing to buffer). moOde maps a radio pause to an actual MPD `stop` command, while leaving the station still loaded in the queue. This project detects that specific case (`state: stop` but a radio URL is still loaded) and treats it as paused rather than idle — otherwise a paused radio stream would incorrectly look identical to genuinely nothing playing.
 
 ---
 
 ## Installation
 
-### 1. Copy files to your Pi
+### Step 1 — Copy the files to your Pi
+
+Upload to `/tmp` first (avoids permission issues), then move into place:
 
 ```bash
-# From your computer:
-scp nowplaying.html nowplaying.php nowplaying-art.php quotes.csv pi@YOUR_PI_IP:/tmp/
-
-# On the Pi:
-sudo cp /tmp/nowplaying.html /tmp/nowplaying.php /tmp/nowplaying-art.php /tmp/quotes.csv /var/www/
-sudo cp /var/www/nowplaying.* /var/www/html/
-sudo chown www-data:www-data /var/www/nowplaying.* /var/www/html/nowplaying.*
+scp var/www/nowplaying.php                              pi@YOUR_PI_IP:/tmp/
+scp var/www/nowplaying-art.php                           pi@YOUR_PI_IP:/tmp/
+scp var/www/nowplaying.html                              pi@YOUR_PI_IP:/tmp/
+scp var/local/www/commandw/spotevent.sh                  pi@YOUR_PI_IP:/tmp/
 ```
-
-### 2. Apply the Spotify pause fix
-
-This is required for the literary clock to appear correctly when Spotify is paused. moOde runs librespot as a persistent service, so without this patch the display never knows Spotify has paused.
 
 ```bash
-sudo python3 patch_spotevent.py
+sudo cp /tmp/nowplaying.php      /var/www/nowplaying.php
+sudo cp /tmp/nowplaying-art.php  /var/www/nowplaying-art.php
+sudo cp /tmp/nowplaying.html     /var/www/nowplaying.html
+sudo chown www-data:www-data /var/www/nowplaying.php /var/www/nowplaying-art.php /var/www/nowplaying.html
+sudo chmod 644 /var/www/nowplaying.php /var/www/nowplaying-art.php /var/www/nowplaying.html
+
+sudo cp /tmp/spotevent.sh /var/local/www/commandw/spotevent.sh
+sudo chown root:root /var/local/www/commandw/spotevent.sh
+sudo chmod +x /var/local/www/commandw/spotevent.sh
 ```
 
-Verify the patch:
-```bash
-grep -A10 "MATCH == 0" /var/local/www/commandw/spotevent.sh
-```
+**If you don't use Spotify Connect**, you can skip the `spotevent.sh` step entirely — local and radio playback work independently of it.
 
-You should see a block that writes `$PLAYER_EVENT` to `/var/local/www/spot_state.txt`.
+### Step 2 — Add the literary clock quotes
 
-### 3. Open on your display device
-
-Navigate to `http://YOUR_PI_IP/nowplaying.html` on your phone or tablet. Any modern browser works, but a kiosk browser is strongly recommended for always-on use so the screen stays on and the URL bar stays hidden.
-
-**Fully Kiosk Browser (Android) — recommended**
-The best option for a dedicated always-on display. [Free version](https://www.fully-kiosk.com/) is sufficient.
-- Web Auto Reload: enabled (recovers automatically if the Pi reboots)
-- Screen Orientation: Portrait
-- Keep Screen On: enabled
-- Screensaver: disabled (the literary clock is the screensaver)
-- Start URL: `http://YOUR_PI_IP/nowplaying.html`
-
-**Regular Chrome or Firefox (Android/iOS) — works fine**
-A simpler option if you don't want to install a dedicated kiosk app. Open the URL, tap the browser menu and select "Add to Home Screen" to create a shortcut. On Android you can use Chrome's "Immersive mode" or a free app like "Full Screen Caller" to hide the status bar. Remember to disable auto-lock in your phone's display settings.
-
-**Safari on iPhone or iPad**
-Open the URL in Safari, tap the Share button and choose "Add to Home Screen". Launch it from the home screen icon and it opens full-screen without the browser chrome. Go to Settings → Display & Brightness → Auto-Lock and set it to Never while using as a display. Note: AirPlay metadata behaviour is untested on this project.
-
----
-
-## How it works
-
-### Metadata flow
-
-```
-Browser (polls every 3s)
-    └─► nowplaying.php
-            ├─ MPD socket (127.0.0.1:6600) — local files, radio
-            ├─ /var/local/www/spot_state.txt — Spotify play/pause state
-            └─ /var/local/www/spotmeta.json  — Spotify track metadata
-```
-
-### Spotify pause detection
-
-moOde runs librespot as a persistent service that never exits, so the traditional "is librespot running?" check always returns true — even when Spotify is paused. The fix: moOde's `spotevent.sh` is called by librespot on every event. We intercept the `playing`/`paused`/`stopped` events (which moOde otherwise discards) and write a one-line state file. `nowplaying.php` reads this file instead of relying on `pgrep`.
-
-### Cover art
-
-- **Local files**: MD5 hash of the folder path, looked up in moOde's thumbnail cache (`/var/local/www/imagesw/thmcache/`)
-- **Radio**: fuzzy filename match against `/var/local/www/imagesw/radio-logos/`
-- **Spotify**: proxied from the Spotify CDN URL in `spotmeta.json`
-
-### Literary clock
-
-Quotes are loaded from `quotes.csv` once on page load and indexed by `HH:MM`. On idle (10 seconds after stop/pause), the clock displays a quote for the current minute. If no exact match exists, it searches ±10 minutes before falling back to a random quote. The quote refreshes at each minute boundary.
-
----
-
-## Radio station logo mapping
-
-If your station logos don't display, add entries to the `$manualMap` array in `nowplaying-art.php`:
-
-```php
-$manualMap = [
-    'BBC Radio 4'    => 'BBC Radio 4',      // stream name => logo filename (no extension)
-    'SomaFM Drone Zone' => 'Soma FM - Drone Zone',
-];
-```
-
-Logo files live in `/var/local/www/imagesw/radio-logos/` on the Pi. The matcher tries multiple filename variants (spaces, underscores, case) before falling back to the manual map.
-
----
-
-## Backup and restore
-
-After installation, back up all modified files:
+A `quotes.csv` is included in `var/www/quotes.csv` — see [QUOTES_FORMAT.md](QUOTES_FORMAT.md) for the format if you'd like to edit or extend it.
 
 ```bash
-sudo mkdir -p /var/backups/moode
-sudo cp /var/www/nowplaying.php     /var/backups/moode/nowplaying.php.bak
-sudo cp /var/www/nowplaying-art.php /var/backups/moode/nowplaying-art.php.bak
-sudo cp /var/www/nowplaying.html    /var/backups/moode/nowplaying.html.bak
-sudo cp /var/local/www/commandw/spotevent.sh /var/backups/moode/spotevent.sh.bak
+scp var/www/quotes.csv pi@YOUR_PI_IP:/tmp/
+```
+```bash
+sudo cp /tmp/quotes.csv /var/www/quotes.csv
+sudo chown www-data:www-data /var/www/quotes.csv
+sudo chmod 644 /var/www/quotes.csv
 ```
 
-To restore:
+### Step 3 — Test from the Pi
 
 ```bash
-sudo cp /var/backups/moode/nowplaying.php.bak     /var/www/nowplaying.php
-sudo cp /var/backups/moode/nowplaying-art.php.bak /var/www/nowplaying-art.php
-sudo cp /var/backups/moode/nowplaying.html.bak    /var/www/nowplaying.html
-sudo cp /var/backups/moode/spotevent.sh.bak       /var/local/www/commandw/spotevent.sh
-sudo cp /var/www/nowplaying.* /var/www/html/
-sudo chown www-data:www-data /var/www/nowplaying.* /var/www/html/nowplaying.*
+curl -s http://127.0.0.1/nowplaying.php | python3 -m json.tool
+```
+
+Should return JSON with the current track's title, artist, source, and state.
+
+### Step 4 — Open the display
+
+On any device on your network:
+```
+http://YOUR_PI_IP/nowplaying.html
 ```
 
 ---
 
-## Credits and attribution
+## Setting up a dedicated wireless display
 
-### Literary clock quotes
+Any Android phone or tablet works. **Fully Kiosk Browser** (free tier) is recommended.
 
-The quotes database (`quotes.csv`) is sourced from the **[epaper-watch](https://github.com/solarkennedy/epaper-watch)** project by Kyle Anderson, which in turn draws from the **[Literature Clock](https://github.com/JohannesNE/literature-clock)** project. The original quote collection was compiled from **The Guardian's books coverage**. All literary quotes remain the property of their respective authors and publishers.
+| Setting | Value |
+|---|---|
+| Start URL | `http://YOUR_PI_IP/nowplaying.html` |
+| Keep Screen On | On |
+| Start on Boot | On |
+| Reload on Reconnect | On |
+| Enable Kiosk Mode | On |
+| Enable Screensaver | Off |
 
-### moOde Audio Player
-
-This project is a display overlay for [moOde Audio Player](https://moodeaudio.org/) by Tim Curtis. It uses moOde's existing nginx, MPD socket, thumbnail cache, and Spotify event hook — no modifications to moOde's core are required beyond the one-line spotevent.sh patch.
+Set the phone's own screen timeout to Never, keep it plugged in, and disable auto-rotate so it stays in portrait.
 
 ---
 
-## Notes and limitations
+## Radio station art
 
-- **AirPlay**: untested — no Apple device was available during development. The MPD state polling should work in principle, but artwork and metadata behaviour are unknown.
-- **VU meters**: simulated (synthesised waveform), not a real audio capture. This avoids browser audio permission prompts on kiosk devices.
-- **Spotify elapsed time**: librespot does not expose elapsed position to `spotevent.sh`, so the progress bar for Spotify counts up locally from 0 on each track change.
-- **moOde version**: developed and tested on moOde 10.x. Earlier versions may have different paths for `spotmeta.json` or `spotevent.sh`.
+Radio logos are looked up via moOde's own `cfg_radio` SQLite table (the same source moOde's UI uses) by exact stream URL match — not fuzzy string matching — so this is reliable for any station already in your moOde library. Falls back to a normalized fuzzy match against the logo folder if a station isn't in the database, then to moOde's default cover if nothing matches.
+
+## Spotify
+
+Enable Spotify Connect normally in moOde (Renderers settings). Once the modified `spotevent.sh` is in place, play/pause/track-change all correctly reflect on the display — including distinguishing a genuinely paused Spotify session from one that's fully disconnected.
+
+## Source priority
+
+When more than one source has recent state (e.g. you paused radio, then started Spotify), the display picks whichever was **most recently active** — an actively-playing source always wins outright; between two paused/idle sources, the one with the more recent timestamp wins. This handles the full matrix of switching between local, radio, and Spotify without stale information bleeding through.
+
+---
+
+## OLED burn-in protection
+
+Built in, no configuration needed:
+
+| Technique | Behaviour |
+|---|---|
+| Pixel drift | Main content nudges up to 7px in a random direction every ~3.5 min, over a slow 14s transition — invisible in normal use |
+| Brightness cycling | Screen brightness varies 88-100% every ~2 min |
+| True black idle | The literary clock (or blank idle screen) is pure `#000000` — OLED pixels are fully off whenever nothing is playing |
+
+---
+
+## Troubleshooting
+
+**Some radio stations show no art**
+Run `Regenerate -> Album cover thumbnail cache` in moOde's Music Library settings (helps local files) — for radio, confirm the station exists in moOde's own station list with a logo assigned.
+
+**Spotify shows the wrong play/pause state**
+Confirm the modified `spotevent.sh` is actually in place and executable:
+```bash
+ls -la /var/local/www/commandw/spotevent.sh
+```
+Check the state file directly while testing:
+```bash
+cat /var/local/www/spotify_playstate.json
+```
+
+**Display gets stuck showing a different source after switching**
+This project handles the switching logic carefully, but if you hit an edge case, check:
+```bash
+curl -s http://127.0.0.1/nowplaying.php | python3 -m json.tool
+```
+and compare `source`/`state` against what's actually playing. Please open an issue with this output if something looks wrong.
+
+**Nothing loads at all**
+```bash
+sudo systemctl status nginx
+sudo systemctl status php8.4-fpm
+```
+
+---
+
+## File reference
+
+| File | Installed to | Purpose |
+|---|---|---|
+| `nowplaying.php` | `/var/www/` | Metadata API — arbitrates local/radio/Spotify |
+| `nowplaying-art.php` | `/var/www/` | Cover art server |
+| `nowplaying.html` | `/var/www/` | The display itself |
+| `spotevent.sh` | `/var/local/www/commandw/` | Modified librespot event hook (Spotify play/pause detection + art caching) |
+
+---
+
+## Contributing
+
+Tested against moOde 10.3.x on Raspberry Pi 5. Pull requests welcome.
+
+If you hit an issue, please include:
+- Your moOde version
+- Output of `curl -s http://127.0.0.1/nowplaying.php | python3 -m json.tool`
+- What you expected vs. what you saw
+
+---
+
+## Licence
+
+MIT — use freely, modify freely, share freely.

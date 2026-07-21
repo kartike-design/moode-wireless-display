@@ -1,136 +1,181 @@
 <?php
+/**
+ * nowplaying-art.php — Cover art server
+ * FIX 4: matches nowplaying.php's recency-based priority — compares
+ * radio's last-active timestamp against Spotify's event timestamp,
+ * so art and metadata never disagree about which source is current.
+ */
+
 header('Cache-Control: no-store');
 
-// Fetch current state from the API
-$stateJson = @file_get_contents('http://127.0.0.1/nowplaying.php');
-$state = $stateJson ? json_decode($stateJson, true) : [];
-$source = $state['source'] ?? '';
+define('RADIO_DB', '/var/local/www/db/moode-sqlite3.db');
+define('LOGO_DIR', '/var/local/www/imagesw/radio-logos/');
+define('SPOTSTATE_FILE', '/var/local/www/spotify_playstate.json');
+define('SPOTCOVER_FILE', '/var/local/www/spotify_cover.jpg');
+define('RADIO_ACTIVE_TS_FILE', '/tmp/radio_active_ts.txt'); // /tmp is always writable by www-data, unlike /var/local/www (root-owned)
+define('SPOT_STALE_SECS', 21600);
 
-// ── Spotify: serve cover from cover_url ────────────────────────
-if ($source === 'spotify' && !empty($state['cover_url'])) {
-    $urls = explode(';', $state['cover_url']);
-    $coverUrl = trim($urls[0]);
-    $img = @file_get_contents($coverUrl, false, stream_context_create([
-        'http' => ['timeout' => 5],
-        'ssl'  => ['verify_peer' => false]
-    ]));
-    if ($img && strlen($img) > 2000) {
-        $finfo = new finfo(FILEINFO_MIME_TYPE);
-        $mime = $finfo->buffer($img) ?: 'image/jpeg';
-        header('Content-Type: ' . $mime);
-        echo $img;
-        exit;
-    }
-}
-
-// ── MPD helpers ────────────────────────────────────────────────
-function mpd_cmd($cmd) {
-    $sock = @fsockopen('127.0.0.1', 6600, $errno, $errstr, 2);
-    if (!$sock) return '';
+function mpd_query() {
+    $sock = @fsockopen('127.0.0.1', 6600, $e, $s, 1.5);
+    if (!$sock) return ['file' => '', 'name' => '', 'state' => 'stop'];
+    stream_set_timeout($sock, 2);
     fgets($sock, 256);
-    $out = '';
-    fwrite($sock, $cmd . "\n");
+
+    fwrite($sock, "status\n");
+    $statusOut = '';
+    $start = microtime(true);
     while (!feof($sock)) {
+        if (microtime(true) - $start > 1.5) break;
         $l = fgets($sock, 1024);
         if ($l === false) break;
-        $out .= $l;
-        if (strpos($l, 'OK') === 0 || strpos($l, 'ACK') === 0) break;
+        $statusOut .= $l;
+        if (strpos($l,'OK')===0 || strpos($l,'ACK')===0) break;
     }
-    fwrite($sock, "close\n");
-    fclose($sock);
-    return $out;
+
+    fwrite($sock, "currentsong\n");
+    $songOut = '';
+    $start = microtime(true);
+    while (!feof($sock)) {
+        if (microtime(true) - $start > 1.5) break;
+        $l = fgets($sock, 1024);
+        if ($l === false) break;
+        $songOut .= $l;
+        if (strpos($l,'OK')===0 || strpos($l,'ACK')===0) break;
+    }
+
+    @fwrite($sock, "close\n");
+    @fclose($sock);
+
+    $file = ''; $name = ''; $state = 'stop';
+    if (preg_match('/^file:\s*(.+)$/mi', $songOut, $m)) $file = trim($m[1]);
+    if (preg_match('/^Name:\s*(.+)$/mi', $songOut, $m))  $name = trim($m[1]);
+    if (preg_match('/^state:\s*(\w+)$/mi', $statusOut, $m)) $state = trim($m[1]);
+
+    return ['file' => $file, 'name' => $name, 'state' => $state];
 }
-function parseKV($raw) {
-    $data = [];
-    foreach (explode("\n", $raw) as $line) {
-        if (strpos($line, ': ') !== false) {
-            list($k, $v) = explode(': ', $line, 2);
-            $data[strtolower(trim($k))] = trim($v);
+
+function serve($path) {
+    $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+    header('Content-Type: ' . ($ext === 'png' ? 'image/png' : 'image/jpeg'));
+    readfile($path);
+    exit;
+}
+
+function normalize($s) {
+    return strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $s));
+}
+
+function findLogoFile($stationName) {
+    if (!$stationName) return null;
+    foreach (['jpg', 'jpeg', 'png'] as $ext) {
+        $p = LOGO_DIR . $stationName . '.' . $ext;
+        if (file_exists($p)) return $p;
+    }
+    return null;
+}
+
+function lookupStationNameFromDB($streamUrl) {
+    if (!$streamUrl || !class_exists('SQLite3') || !file_exists(RADIO_DB)) return null;
+    try {
+        $db = new SQLite3(RADIO_DB, SQLITE3_OPEN_READONLY);
+        $db->busyTimeout(500);
+        $stmt = $db->prepare('SELECT name FROM cfg_radio WHERE station = :url LIMIT 1');
+        $stmt->bindValue(':url', $streamUrl, SQLITE3_TEXT);
+        $res = $stmt->execute();
+        $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : null;
+        $db->close();
+        return $row['name'] ?? null;
+    } catch (Exception $e) {
+        return null;
+    }
+}
+
+function fuzzyFindLogo($stationName, $streamFile) {
+    if (!is_dir(LOGO_DIR)) return null;
+    $candidates = [];
+    if ($stationName) $candidates[] = normalize($stationName);
+    if ($streamFile) {
+        $base = pathinfo(parse_url($streamFile, PHP_URL_PATH) ?: '', PATHINFO_FILENAME);
+        if ($base) $candidates[] = normalize($base);
+    }
+    $candidates = array_unique(array_filter($candidates));
+    if (!$candidates) return null;
+    $files = scandir(LOGO_DIR);
+    foreach ($files as $f) {
+        if ($f === '.' || $f === '..') continue;
+        $logoNorm = normalize(pathinfo($f, PATHINFO_FILENAME));
+        if (!$logoNorm) continue;
+        foreach ($candidates as $c) {
+            if ($logoNorm === $c) return LOGO_DIR . $f;
         }
     }
-    return $data;
-}
-
-$status = parseKV(mpd_cmd('status'));
-$song   = parseKV(mpd_cmd('currentsong'));
-$file   = $song['file'] ?? '';
-$isRadio = (strpos($file, 'http://') === 0 || strpos($file, 'https://') === 0);
-$stationName = $song['name'] ?? '';
-
-// ── Radio logo name normalisation ─────────────────────────────
-// Add your own station name mappings here if moOde's stream name
-// doesn't match the logo filename in radio-logos/.
-// Format: 'Stream name in MPD' => 'Logo filename (without extension)'
-$manualMap = [
-    // Examples — edit or extend as needed:
-    // 'SomaFM Drone Zone' => 'Soma FM - Drone Zone',
-    // 'BBC Radio 4'       => 'BBC Radio 4',
-];
-if (isset($manualMap[$stationName])) {
-    $stationName = $manualMap[$stationName];
-}
-
-function findRadioLogo($stationName) {
-    $logoDir = '/var/local/www/imagesw/radio-logos/';
-    if (!is_dir($logoDir)) return null;
-    $clean = preg_replace('/\s*\([^)]*\)/', '', $stationName);
-    $clean = trim($clean);
-    $variants = [
-        $stationName, $clean,
-        str_replace(' ', '_', $stationName), str_replace(' ', '_', $clean),
-        str_replace(' ', '', $stationName), str_replace(' ', '', $clean),
-        preg_replace('/[^a-zA-Z0-9]/', '_', $stationName),
-        preg_replace('/[^a-zA-Z0-9]/', '_', $clean),
-    ];
-    foreach ($variants as $v) { $variants[] = strtolower($v); }
-    $variants = array_unique($variants);
-    $files = scandir($logoDir);
-    foreach ($files as $file) {
-        if ($file === '.' || $file === '..') continue;
-        $base = pathinfo($file, PATHINFO_FILENAME);
-        foreach ($variants as $variant) {
-            if (strcasecmp($base, $variant) === 0) {
-                return $logoDir . $file;
+    foreach ($files as $f) {
+        if ($f === '.' || $f === '..') continue;
+        $logoNorm = normalize(pathinfo($f, PATHINFO_FILENAME));
+        if (!$logoNorm) continue;
+        foreach ($candidates as $c) {
+            if (strlen($c) >= 6 && (strpos($c, $logoNorm) !== false || strpos($logoNorm, $c) !== false)) {
+                return LOGO_DIR . $f;
             }
         }
     }
     return null;
 }
 
-// ── Local files: use moOde thumbnail cache ─────────────────────
-if (!$isRadio && $file && strpos($file, 'http') !== 0) {
-    $hash = md5(dirname($file));
-    $cached = '/var/local/www/imagesw/thmcache/' . $hash . '.jpg';
-    if (file_exists($cached) && filesize($cached) > 2000) {
-        header('Content-Type: image/jpeg');
-        readfile($cached);
-        exit;
+function getSpotifyState() {
+    if (!file_exists(SPOTSTATE_FILE)) return null;
+    $raw = @file_get_contents(SPOTSTATE_FILE);
+    if (!$raw) return null;
+    $d = json_decode($raw, true);
+    if (!$d || empty($d['state'])) return null;
+    $ts = (int)($d['ts'] ?? 0);
+    if ($ts && (time() - $ts) > SPOT_STALE_SECS) return null;
+    return ['state' => $d['state'], 'ts' => $ts];
+}
+
+function getRadioActiveTs() {
+    if (!file_exists(RADIO_ACTIVE_TS_FILE)) return 0;
+    return (int)trim(@file_get_contents(RADIO_ACTIVE_TS_FILE));
+}
+
+function serveRadioOrLocal($file, $mpdName, $isRadio) {
+    if ($isRadio) {
+        $dbName = lookupStationNameFromDB($file);
+        if ($dbName) {
+            $logo = findLogoFile($dbName);
+            if ($logo) serve($logo);
+        }
+        $logo = fuzzyFindLogo($mpdName, $file);
+        if ($logo) serve($logo);
+    } elseif ($file) {
+        $cached = '/var/local/www/imagesw/thmcache/' . md5(dirname($file)) . '.jpg';
+        if (file_exists($cached) && filesize($cached) > 500) serve($cached);
     }
 }
 
-// ── Radio logos ────────────────────────────────────────────────
-if ($isRadio && !empty($stationName)) {
-    $logoPath = findRadioLogo($stationName);
-    if ($logoPath && file_exists($logoPath)) {
-        $ext = strtolower(pathinfo($logoPath, PATHINFO_EXTENSION));
-        $mime = ($ext === 'png') ? 'image/png' : 'image/jpeg';
-        header('Content-Type: ' . $mime);
-        readfile($logoPath);
-        exit;
-    }
+function serveSpotifyCover() {
+    if (file_exists(SPOTCOVER_FILE) && filesize(SPOTCOVER_FILE) > 500) serve(SPOTCOVER_FILE);
 }
 
-// ── Default cover (1×1 transparent GIF fallback) ───────────────
-$defaultPaths = [
-    '/var/www/images/default-album-cover.png',
-    '/var/www/html/images/default-album-cover.png'
-];
-foreach ($defaultPaths as $default) {
-    if (file_exists($default)) {
-        header('Content-Type: ' . mime_content_type($default));
-        readfile($default);
-        exit;
-    }
+$q = mpd_query();
+$file     = $q['file'];
+$mpdName  = $q['name'];
+$mpdState = $q['state'];
+$isRadio  = (strpos($file, 'http://') === 0 || strpos($file, 'https://') === 0);
+
+$spot = getSpotifyState();
+$radioStillLoaded = ($mpdState === 'stop' && $isRadio && !empty($file));
+$radioActiveTs = getRadioActiveTs();
+
+// Same recency-based priority chain as nowplaying.php
+if ($mpdState === 'play' || $mpdState === 'pause') {
+    serveRadioOrLocal($file, $mpdName, $isRadio);
+} elseif ($spot && $spot['state'] === 'playing') {
+    serveSpotifyCover();
+} elseif ($radioStillLoaded && (!$spot || $radioActiveTs >= $spot['ts'])) {
+    serveRadioOrLocal($file, $mpdName, $isRadio);
+} elseif ($spot && $spot['state'] === 'paused') {
+    serveSpotifyCover();
 }
-header('Content-Type: image/gif');
-echo base64_decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7');
+
+header('Location: /images/default-album-cover.png');
