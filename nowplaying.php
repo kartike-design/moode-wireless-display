@@ -2,13 +2,14 @@
 /**
  * nowplaying.php — moOde Now Playing metadata API
  *
- * FIX 4: pausing Spotify after it had priority showed stale radio
- * instead — both "radio loaded" and "Spotify paused" looked equally
- * stale to a fixed priority order. Fixed by tracking an actual
- * recency timestamp for radio (written only while radio is truly
- * playing) and comparing it against Spotify's own event timestamp —
- * whichever source was more recently active wins, rather than a
- * static guess.
+ * FIX 5: local pause had the same staleness problem radio pause did.
+ * A local track paused hours ago would still outrank an actively-used
+ * Spotify session, since "MPD pause" was treated as always-unambiguous.
+ * Generalized the recency comparison: MPD 'play' and Spotify 'playing'
+ * are the only truly unambiguous states (mutually exclusive in
+ * practice, since Spotify connecting stops MPD); everything else
+ * (MPD pause — local or radio-loaded — vs Spotify paused) is decided
+ * by comparing which was more recently active.
  */
 
 header('Content-Type: application/json');
@@ -17,7 +18,9 @@ header('Cache-Control: no-store');
 define('RADIO_DB', '/var/local/www/db/moode-sqlite3.db');
 define('SPOTMETA_FILE', '/var/local/www/spotmeta.json');
 define('SPOTSTATE_FILE', '/var/local/www/spotify_playstate.json');
-define('RADIO_ACTIVE_TS_FILE', '/tmp/radio_active_ts.txt'); // /tmp is always writable by www-data, unlike /var/local/www (root-owned)
+// Generalized from radio-specific — tracks ANY genuine MPD 'play' activity,
+// local or radio, so it can be compared against Spotify's own timestamp.
+define('MPD_ACTIVE_TS_FILE', '/tmp/mpd_active_ts.txt');
 define('SPOT_STALE_SECS', 21600);
 
 function mpd_cmd($sock, $cmd) {
@@ -65,7 +68,6 @@ function normalize($s) {
     return strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $s));
 }
 
-// Returns ['state' => ..., 'ts' => ...] or null
 function getSpotifyState() {
     if (!file_exists(SPOTSTATE_FILE)) return null;
     $raw = @file_get_contents(SPOTSTATE_FILE);
@@ -77,13 +79,13 @@ function getSpotifyState() {
     return ['state' => $d['state'], 'ts' => $ts];
 }
 
-function getRadioActiveTs() {
-    if (!file_exists(RADIO_ACTIVE_TS_FILE)) return 0;
-    return (int)trim(@file_get_contents(RADIO_ACTIVE_TS_FILE));
+function getMpdActiveTs() {
+    if (!file_exists(MPD_ACTIVE_TS_FILE)) return 0;
+    return (int)trim(@file_get_contents(MPD_ACTIVE_TS_FILE));
 }
 
-function touchRadioActiveTs() {
-    @file_put_contents(RADIO_ACTIVE_TS_FILE, (string)time());
+function touchMpdActiveTs() {
+    @file_put_contents(MPD_ACTIVE_TS_FILE, (string)time());
 }
 
 function populateRadio(&$out, $song, $file) {
@@ -119,6 +121,20 @@ function populateSpotify(&$out, $state) {
     return true;
 }
 
+function populateMpdPaused(&$out, $mpdState, $song, $file, $isRadio, $status) {
+    $out['state']    = 'pause';
+    $out['file']     = $file;
+    $out['elapsed']  = floatval($status['elapsed']  ?? 0);
+    $out['duration'] = floatval($status['duration'] ?? 0);
+    $out['source']   = $isRadio ? 'radio' : 'local';
+    if ($isRadio) { populateRadio($out, $song, $file); }
+    else {
+        $out['title']  = $song['title']  ?? basename($file);
+        $out['artist'] = $song['artist'] ?? ($song['albumartist'] ?? '');
+        $out['album']  = $song['album']  ?? '';
+    }
+}
+
 $out = [
     'state'    => 'stop',
     'title'    => '',
@@ -151,21 +167,16 @@ if ($sock) {
     $isRadio  = (strpos($file, 'http://') === 0 || strpos($file, 'https://') === 0);
 }
 
-// Track genuine radio activity — only written while radio is truly
-// playing, giving us a real recency signal for the "is this stale"
-// comparison against Spotify's own event timestamp.
-if ($mpdState === 'play' && $isRadio) {
-    touchRadioActiveTs();
-}
-
-$spot = getSpotifyState(); // ['state'=>.., 'ts'=>..] or null
+$spot = getSpotifyState();
 $radioStillLoaded = ($mpdState === 'stop' && $isRadio && !empty($file));
-$radioActiveTs = getRadioActiveTs();
 
 // ── Priority chain ──────────────────────────────────────────────
-if ($mpdState === 'play' || $mpdState === 'pause') {
-    // 1. Unambiguous MPD-active state always wins
-    $out['state']    = $mpdState;
+if ($mpdState === 'play') {
+    // 1. MPD actively playing right now — unambiguous. Track this
+    //    moment so a later stale pause can be correctly out-ranked
+    //    by a more recent Spotify session.
+    touchMpdActiveTs();
+    $out['state']    = 'play';
     $out['file']     = $file;
     $out['elapsed']  = floatval($status['elapsed']  ?? 0);
     $out['duration'] = floatval($status['duration'] ?? 0);
@@ -178,22 +189,24 @@ if ($mpdState === 'play' || $mpdState === 'pause') {
     }
 
 } elseif ($spot && $spot['state'] === 'playing') {
-    // 2. Spotify actively playing — unambiguous, always wins
+    // 2. Spotify actively playing right now — unambiguous, always wins.
+    //    (MPD 'play' and Spotify 'playing' shouldn't co-occur — Spotify
+    //     connecting stops MPD — so this ordering is safe.)
     populateSpotify($out, $spot['state']);
 
-} elseif ($radioStillLoaded && (!$spot || $radioActiveTs >= $spot['ts'])) {
-    // 3. Radio paused, and it was MORE (or equally) recently active
-    //    than whatever Spotify last reported — radio wins
-    $out['state']    = 'pause';
-    $out['file']     = $file;
-    $out['source']   = 'radio';
-    populateRadio($out, $song, $file);
+} else {
+    // 3. Nothing is truly "happening right now" — both candidates are
+    //    merely paused/idle. Compare which was more recently active.
+    $mpdCandidateActive = ($mpdState === 'pause') || $radioStillLoaded;
+    $mpdTs  = getMpdActiveTs();
+    $spotTs = $spot['ts'] ?? 0;
 
-} elseif ($spot && $spot['state'] === 'paused') {
-    // 4. Spotify paused, and either radio isn't loaded or Spotify's
-    //    event is more recent than radio's last known activity
-    populateSpotify($out, $spot['state']);
+    if ($mpdCandidateActive && (!$spot || $mpdTs >= $spotTs)) {
+        populateMpdPaused($out, $mpdState, $song, $file, $isRadio, $status);
+    } elseif ($spot && $spot['state'] === 'paused') {
+        populateSpotify($out, $spot['state']);
+    }
+    // else: nothing active anywhere, defaults (state=stop) stand
 }
-// 5. else: nothing active anywhere, defaults (state=stop) stand
 
 echo json_encode($out);
