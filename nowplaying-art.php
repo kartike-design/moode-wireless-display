@@ -1,9 +1,14 @@
 <?php
 /**
  * nowplaying-art.php — Cover art server
- * FIX 4: matches nowplaying.php's recency-based priority — compares
- * radio's last-active timestamp against Spotify's event timestamp,
- * so art and metadata never disagree about which source is current.
+ *
+ * FIX 5: matches nowplaying.php's generalized recency logic — MPD
+ * 'play' and Spotify 'playing' are the only unambiguous states;
+ * everything else (MPD pause — local or radio-loaded — vs Spotify
+ * paused) is decided by comparing which was more recently active.
+ * Previously only radio's staleness was compared against Spotify;
+ * a long-paused LOCAL file could still incorrectly outrank an
+ * actively-used Spotify session.
  */
 
 header('Cache-Control: no-store');
@@ -12,7 +17,7 @@ define('RADIO_DB', '/var/local/www/db/moode-sqlite3.db');
 define('LOGO_DIR', '/var/local/www/imagesw/radio-logos/');
 define('SPOTSTATE_FILE', '/var/local/www/spotify_playstate.json');
 define('SPOTCOVER_FILE', '/var/local/www/spotify_cover.jpg');
-define('RADIO_ACTIVE_TS_FILE', '/tmp/radio_active_ts.txt'); // /tmp is always writable by www-data, unlike /var/local/www (root-owned)
+define('MPD_ACTIVE_TS_FILE', '/tmp/mpd_active_ts.txt');
 define('SPOT_STALE_SECS', 21600);
 
 function mpd_query() {
@@ -133,9 +138,13 @@ function getSpotifyState() {
     return ['state' => $d['state'], 'ts' => $ts];
 }
 
-function getRadioActiveTs() {
-    if (!file_exists(RADIO_ACTIVE_TS_FILE)) return 0;
-    return (int)trim(@file_get_contents(RADIO_ACTIVE_TS_FILE));
+function getMpdActiveTs() {
+    if (!file_exists(MPD_ACTIVE_TS_FILE)) return 0;
+    return (int)trim(@file_get_contents(MPD_ACTIVE_TS_FILE));
+}
+
+function touchMpdActiveTs() {
+    @file_put_contents(MPD_ACTIVE_TS_FILE, (string)time());
 }
 
 function serveRadioOrLocal($file, $mpdName, $isRadio) {
@@ -165,17 +174,25 @@ $isRadio  = (strpos($file, 'http://') === 0 || strpos($file, 'https://') === 0);
 
 $spot = getSpotifyState();
 $radioStillLoaded = ($mpdState === 'stop' && $isRadio && !empty($file));
-$radioActiveTs = getRadioActiveTs();
 
-// Same recency-based priority chain as nowplaying.php
-if ($mpdState === 'play' || $mpdState === 'pause') {
+// Same generalized priority chain as nowplaying.php
+if ($mpdState === 'play') {
+    touchMpdActiveTs();
     serveRadioOrLocal($file, $mpdName, $isRadio);
+
 } elseif ($spot && $spot['state'] === 'playing') {
     serveSpotifyCover();
-} elseif ($radioStillLoaded && (!$spot || $radioActiveTs >= $spot['ts'])) {
-    serveRadioOrLocal($file, $mpdName, $isRadio);
-} elseif ($spot && $spot['state'] === 'paused') {
-    serveSpotifyCover();
+
+} else {
+    $mpdCandidateActive = ($mpdState === 'pause') || $radioStillLoaded;
+    $mpdTs  = getMpdActiveTs();
+    $spotTs = $spot['ts'] ?? 0;
+
+    if ($mpdCandidateActive && (!$spot || $mpdTs >= $spotTs)) {
+        serveRadioOrLocal($file, $mpdName, $isRadio);
+    } elseif ($spot && $spot['state'] === 'paused') {
+        serveSpotifyCover();
+    }
 }
 
 header('Location: /images/default-album-cover.png');
